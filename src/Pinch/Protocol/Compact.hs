@@ -1,6 +1,8 @@
 {-# LANGUAGE BangPatterns        #-}
 {-# LANGUAGE CPP                 #-}
+{-# LANGUAGE DeriveDataTypeable  #-}
 {-# LANGUAGE GADTs               #-}
+{-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 -- |
 -- Module      :  Pinch.Protocol.Compact
@@ -19,15 +21,15 @@ import Control.Applicative
 #endif
 
 import Control.Monad
-import Data.List           (sortBy)
-import Data.Ord            (comparing)
 import Data.Bits           hiding (shift)
 import Data.ByteString     (ByteString)
-import Data.Foldable       (null)
 import Data.HashMap.Strict (HashMap)
 import Data.Int            (Int16, Int32, Int64)
-import Data.Word           (Word64, Word8)
+import Data.List           (sortBy)
 import Data.Monoid
+import Data.Ord            (comparing)
+import Data.Typeable       (Typeable)
+import Data.Word           (Word64, Word8)
 
 import qualified Data.ByteString     as B
 import qualified Data.HashMap.Strict as M
@@ -48,34 +50,31 @@ import qualified Pinch.Internal.Parser   as P
 -- | Provides an implementation of the Thrift Compact Protocol.
 compactProtocol :: Protocol
 compactProtocol = Protocol
-    { serializeValue     = binarySerialize
-    , deserializeValue'  = binaryDeserialize ttype
-    , serializeMessage   = binarySerializeMessage
-    , deserializeMessage = binaryDeserializeMessage
+    { serializeValue     = compactSerialize
+    , deserializeValue'  = compactDeserialize ttype
+    , serializeMessage   = compactSerializeMessage
+    , deserializeMessage = compactDeserializeMessage
     }
 
 ------------------------------------------------------------------------------
-
-bword8 :: Word8 -> Builder
-bword8 = BB.int8 . fromIntegral
 
 protocolId, version :: Word8
 protocolId = 0x82
 version = 0x01
 
-binarySerializeMessage :: Message -> Builder
-binarySerializeMessage msg =
-    bword8 protocolId <>
-    bword8 ((version .&. 0x1f) .|. (messageCode (messageType msg) `shiftL` 5)) <>
+compactSerializeMessage :: Message -> Builder
+compactSerializeMessage msg =
+    BB.word8 protocolId <>
+    BB.word8 ((version .&. 0x1f) .|. (messageCode (messageType msg) `shiftL` 5)) <>
     serializeVarint (fromIntegral $ messageId msg) <>
     string (TE.encodeUtf8 $ messageName msg) <>
-    binarySerialize (messagePayload msg)
+    compactSerialize (messagePayload msg)
 
-binaryDeserializeMessage :: ByteString -> Either String Message
-binaryDeserializeMessage = runParser binaryMessageParser
+compactDeserializeMessage :: ByteString -> Either String Message
+compactDeserializeMessage = runParser compactMessageParser
 
-binaryMessageParser :: Parser Message
-binaryMessageParser = do
+compactMessageParser :: Parser Message
+compactMessageParser = do
     pid <- P.word8
     when (pid /= protocolId) $ fail "Invalid protocol ID"
     w <- P.word8
@@ -84,10 +83,11 @@ binaryMessageParser = do
     let code = w `shiftR` 5
     msgId <- parseVarint
     msgName <- TE.decodeUtf8 <$> (parseVarint >>= P.take . fromIntegral)
-    payload <- binaryParser ttype
-    return Message { messageType = case fromMessageCode code of
-                                     Nothing -> error $ "unknown message type: " ++ show code
-                                     Just t -> t
+    payload <- compactParser ttype
+    mtype <- case fromMessageCode code of
+        Nothing -> fail $ "unknown message type: " ++ show code
+        Just t -> return t
+    return Message { messageType = mtype
                    , messageId = fromIntegral msgId
                    , messageName = msgName
                    , messagePayload = payload
@@ -96,11 +96,11 @@ binaryMessageParser = do
 
 ------------------------------------------------------------------------------
 
-binaryDeserialize :: TType a -> ByteString -> Either String (ByteString, Value a)
-binaryDeserialize t = runParser' (binaryParser t)
+compactDeserialize :: TType a -> ByteString -> Either String (ByteString, Value a)
+compactDeserialize t = runParser' (compactParser t)
 
-binaryParser :: TType a -> Parser (Value a)
-binaryParser typ = case typ of
+compactParser :: TType a -> Parser (Value a)
+compactParser typ = case typ of
   TBool      -> do
       n <- P.int8
       return $ VBool (n == 1)
@@ -159,7 +159,8 @@ parseInt64 = VInt64 . fromIntegral . zigZagToInt <$> parseVarint
 parseBinary :: Parser (Value TBinary)
 parseBinary = do
     n <- parseVarint
-    when (n < 0) $ fail "parseBinary: invalid length"
+    when (n < 0) $
+        fail $ "parseBinary: invalid length " ++ show n
     VBinary <$> P.take (fromIntegral n)
 
 
@@ -170,74 +171,62 @@ parseMap = do
       0 -> return VNullMap
       _ -> do
           tys <- P.word8
-          ktype' <- getCType (tys `shiftR` 4)
-          vtype' <- getCType (tys .&. 0x0f)
+          SomeCType kctype <- getCType (tys `shiftR` 4)
+          SomeCType vctype <- getCType (tys .&. 0x0f)
 
-          case (ktype', vtype') of
-            (SomeCType kctype, SomeCType vctype) -> do
-              ktype <- pure $ cTypeToTType kctype
-              vtype <- pure $ cTypeToTType vctype
-              items <- FL.replicateM (fromIntegral count) $
-                  MapItem <$> binaryParser ktype
-                          <*> binaryParser vtype
-              return $ VMap items
+          let ktype = cTypeToTType kctype
+              vtype = cTypeToTType vctype
 
+          items <- FL.replicateM (fromIntegral count) $
+              MapItem <$> compactParser ktype
+                      <*> compactParser vtype
+          return $ VMap items
+
+
+parseCollection
+    :: (forall a. IsTType a => FL.FoldList (Value a) -> Value b)
+    -> Parser (Value b)
+parseCollection buildValue = do
+    sizeAndType <- P.word8
+    SomeCType ctype <- getCType (sizeAndType .&. 0x0f)
+    count <- case sizeAndType `shiftR` 4 of
+                 0xf -> parseVarint
+                 n   -> return $ fromIntegral n
+    let vtype  = cTypeToTType ctype
+    buildValue <$> FL.replicateM (fromIntegral count) (compactParser vtype)
 
 parseSet :: Parser (Value TSet)
-parseSet = do
-    size_and_type <- P.word8
-    ctype' <- getCType (size_and_type .&. 0x0f)
-    count <- case size_and_type `shiftR` 4 of
-                 0xf -> parseVarint
-                 n   -> return $ fromIntegral n
-
-    case ctype' of
-      SomeCType ctype -> do
-          vtype <- pure $ cTypeToTType ctype
-          VSet <$> FL.replicateM (fromIntegral count) (binaryParser vtype)
-
+parseSet = parseCollection VSet
 
 parseList :: Parser (Value TList)
-parseList = do
-    size_and_type <- P.word8
-    ctype' <- getCType (size_and_type .&. 0x0f)
-    count <- case size_and_type `shiftR` 4 of
-                 0xf -> parseVarint
-                 n   -> return $ fromIntegral n
-
-    case ctype' of
-      SomeCType ctype -> do
-          vtype <- pure $ cTypeToTType ctype
-          VList <$> FL.replicateM (fromIntegral count) (binaryParser vtype)
-
+parseList = parseCollection VList
 
 parseStruct :: Parser (Value TStruct)
 parseStruct = loop M.empty 0
   where
     loop :: HashMap Int16 SomeValue -> Int16 -> Parser (Value TStruct)
     loop fields lastFieldId = do
-        size_and_type <- P.word8
-        ctype' <- getCType (size_and_type .&. 0x0f)
-        case ctype' of
-            SomeCType CStop -> return (VStruct fields)
+        sizeAndType <- P.word8
+        SomeCType ctype <- getCType (sizeAndType .&. 0x0f)
+        case ctype of
+            CStop -> return (VStruct fields)
             _     -> do
-                fieldId <- case size_and_type `shiftR` 4 of
+                fieldId <- case sizeAndType `shiftR` 4 of
                                0x0 -> fromIntegral . zigZagToInt <$> parseVarint
                                n   -> return (lastFieldId + fromIntegral n)
-
-                value <- case ctype' of
-                  SomeCType CBoolTrue  -> return (SomeValue $ VBool True)
-                  SomeCType CBoolFalse -> return (SomeValue $ VBool False)
-                  SomeCType ctype      -> do
-                      vtype <- return $ cTypeToTType ctype
-                      SomeValue <$> binaryParser vtype
+                value <- case ctype of
+                  CBoolTrue  -> return (SomeValue $ VBool True)
+                  CBoolFalse -> return (SomeValue $ VBool False)
+                  _          ->
+                    let vtype = cTypeToTType ctype
+                     in SomeValue <$> compactParser vtype
                 loop (M.insert fieldId value fields) fieldId
 
 
 ------------------------------------------------------------------------------
 
-binarySerialize :: forall a. IsTType a => Value a -> Builder
-binarySerialize = case (ttype :: TType a) of
+compactSerialize :: forall a. IsTType a => Value a -> Builder
+compactSerialize = case (ttype :: TType a) of
   TBinary  -> serializeBinary
   TBool    -> serializeBool
   TByte    -> serializeByte
@@ -249,11 +238,10 @@ binarySerialize = case (ttype :: TType a) of
   TList    -> serializeList
   TMap     -> serializeMap
   TSet     -> serializeSet
-{-# INLINE binarySerialize #-}
+{-# INLINE compactSerialize #-}
 
 serializeBinary :: Value TBinary -> Builder
-serializeBinary (VBinary x) =
-    serializeVarint (fromIntegral $ B.length x) <> BB.byteString x
+serializeBinary (VBinary x) = string x
 {-# INLINE serializeBinary #-}
 
 serializeBool :: Value TBool -> Builder
@@ -275,9 +263,9 @@ serializeVarint = go . fromIntegral
     go :: Word64 -> Builder
     go n
       | complement 0x7f .&. n == 0 =
-        bword8 $ fromIntegral n
+        BB.word8 $ fromIntegral n
       | otherwise =
-        bword8 (0x80 .|. (fromIntegral n .&. 0x7f)) <>
+        BB.word8 (0x80 .|. (fromIntegral n .&. 0x7f)) <>
         go (n `shiftR` 7)
 
 serializeInt16 :: Value TInt16 -> Builder
@@ -310,7 +298,7 @@ serializeStruct (VStruct fields) =
                   SomeValue (VBool True)  -> writeFieldHeader CBoolTrue
                   SomeValue (VBool False) -> writeFieldHeader CBoolFalse
                   SomeValue (v :: Value a) ->
-                      writeFieldHeader (tTypeToCType (ttype :: TType a)) <> binarySerialize v
+                      writeFieldHeader (tTypeToCType (ttype :: TType a)) <> compactSerialize v
         in x <> loop fieldId rest
       where
         writeFieldHeader :: CType a -> Builder
@@ -328,16 +316,16 @@ serializeMap (VMap items) = serialize ttype ttype items
     serialize
         :: (IsTType k, IsTType v)
         => TType k -> TType v -> FL.FoldList (MapItem k v) -> Builder
-    serialize _  _  xs
-      | null xs        = BB.int8 0
-    serialize kt vt xs =
-        serializeVarint (fromIntegral size) <> bword8 typeByte <> body
+    serialize kt vt xs
+        | size == 0 = BB.int8 0
+        | otherwise =
+            serializeVarint (fromIntegral size) <> BB.word8 typeByte <> body
       where
         code = toCompactCode . tTypeToCType
-        typeByte = (code kt `shiftL` 4) .|. (code vt)
+        typeByte = (code kt `shiftL` 4) .|. code vt
         (body, size) = FL.foldl' go (mempty, 0 :: Int32) xs
         go (prev, !c) (MapItem k v) =
-            ( prev <> binarySerialize k <> binarySerialize v
+            ( prev <> compactSerialize k <> compactSerialize v
             , c + 1
             )
 {-# INLINE serializeMap #-}
@@ -346,7 +334,7 @@ serializeCollection
     :: IsTType a
     => TType a -> FL.FoldList (Value a) -> Builder
 serializeCollection vtype xs =
-    let go (prev, !c) item = (prev <> binarySerialize item, c + 1)
+    let go (prev, !c) item = (prev <> compactSerialize item, c + 1)
         (body, size) = FL.foldl' go (mempty, 0 :: Int32) xs
         type_and_size
           | size < 15 = typeCode' vtype (fromIntegral size)
@@ -374,7 +362,7 @@ fromMessageCode _ = Nothing
 {-# INLINE fromMessageCode #-}
 
 
-data TStop
+data TStop deriving (Typeable)
 
 instance IsTType TStop where
     ttype = error "ttype TStop"
@@ -472,16 +460,16 @@ string b = serializeVarint (fromIntegral $ B.length b) <> BB.byteString b
 {-# INLINE string #-}
 
 compactCode :: CType a -> Builder
-compactCode = bword8 . toCompactCode
+compactCode = BB.word8 . toCompactCode
 {-# INLINE compactCode #-}
 
 compactCode' :: CType a  -- ^ The compact type code
              -> Word8    -- ^ a four-bit (unshifted) payload
              -> Builder
 compactCode' ty payload =
-    bword8 (toCompactCode ty .|. (fromIntegral payload `shiftL` 4))
+    BB.word8 (toCompactCode ty .|. (fromIntegral payload `shiftL` 4))
 {-# INLINE compactCode' #-}
 
 typeCode' :: TType a -> Word8 -> Builder
-typeCode' ty payload = compactCode' (tTypeToCType ty) payload
+typeCode' ty = compactCode' (tTypeToCType ty)
 {-# INLINE typeCode' #-}
